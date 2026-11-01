@@ -1,0 +1,10 @@
+{
+  "name": "Aayojan Studio — Event Planning Engine",
+  "description": "A production-grade, versioned event-planning engine for weddings, birthdays, and community events with typed LLM operations, deterministic budget and backward-timeline validation, explainable Plan Health Score, what-if sliders, and role-based sharing.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

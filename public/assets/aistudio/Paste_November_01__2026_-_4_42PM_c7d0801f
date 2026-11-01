@@ -1,0 +1,493 @@
+Aayojan — Master Build Spec and Agent Prompt
+v1.0 | Single source of truth: PRD, UX, API, system design, reliability, testing, and the coding-agent prompt | Owner: Mayank Sharma
+0. How to use this document
+1. Save as /docs/SPEC.md in the repo root.
+2. Paste Section 16 into Claude Code or Cursor. It tells the agent this file is authoritative.
+3. Reliability promise. No system is literally unbreakable. This design guarantees: (a) an invalid plan is never persisted or shown, (b) committed data is never lost, (c) every dependency failure degrades to a reduced working mode, never a blank error page.
+1. Product Requirements (PRD)
+1.1 Problem
+Event planning fails at change, not at creation. A venue falls through, guests go from 80 to 150, the budget is cut, and every spreadsheet, WhatsApp thread and checklist is stale within a day. Existing GenAI planners emit a one-time checklist and go silent.
+1.2 Solution
+Aayojan maintains one verified, versioned Event object (budget, timeline, vendors, tasks, ideas) and re-solves it after every change. An LLM translates language into typed operations; deterministic code applies, validates, scores and diffs them. The user always sees what changed and why.
+1.3 Personas
+• Riya, 28: plans her sister's 200-guest Jaipur wedding on a Rs 12L budget; needs a plan she can trust and share with family.
+• Arjun, 34: plans a 10-year-old's birthday; wants ideas and a fast, cheap plan.
+• Meena, 52: RWA secretary running a community Diwali mela; needs permits, volunteers, sponsors, donations.
+• Collaborators: family, vendors, volunteers; read-limited role views via share link.
+1.4 Goals and non-goals
+Goals: living plan, explainable replan, measurable validity, three event modes, premium UX, shareable and exportable output. Non-goals (v1): payments, vendor marketplace, native mobile apps, real vendor bookings, multi-language UI (Hinglish drafts only).
+1.5 Success metrics
+Metric
+Target
+Plan generation, skeleton visible
+<= 3s p95
+Plan generation, complete
+<= 30s p95
+Replan (typed ops)
+<= 8s p95
+Persisted versions passing validator
+100% (hard invariant)
+LLM ops valid on first pass
+>= 95%
+LLM ops valid after <= 2 retries
+100% on eval suite
+Availability SLO
+99.9% monthly
+Degraded-mode coverage
+every external dependency has a fallback
+1.6 Functional requirements
+ID
+Requirement
+FR-1
+Intake: free text (optional voice via Web Speech API) to structured brief; at most 3 follow-up questions; sensible defaults for anything unanswered, flagged as assumptions
+FR-2
+Budget engine: template split by event type and city tier, LLM-proposed adjustments bounded by code, planned vs actual, overrun alerts at 80% and 100% per category
+FR-3
+Backward timeline: tasks scheduled from the event date with dependencies, durations, owners; critical path highlighted
+FR-4
+Vendor kit per category: what to ask, red flags, quote comparison table with normalized Rs per guest, outreach drafts (WhatsApp, email; English, Hinglish)
+FR-5
+Ideas: themes, menus, games, decor, run-of-show matched to age, culture, budget tier, indoor or outdoor
+FR-6
+Replan: natural-language edit to typed ops to validated new version to diff view; undo to any prior version
+FR-7
+What-if preview: sliders for budget, guests, date show a non-committed diff and health delta in under 1s (deterministic path, no LLM)
+FR-8
+Plan Health Score 0-100 with itemized, explainable deductions
+FR-9
+Modes: wedding (multi-function), birthday, community (permits, volunteers, sponsors, donations)
+FR-10
+Realtime: live progress stream during generation; live multi-user sync on one event; presence
+FR-11
+Share links with roles: family (budget and approvals), vendor (own tasks only), volunteer (roster only); expiring and revocable
+FR-12
+Export: PDF plan, .ics calendar, JSON
+FR-13
+Actuals: log expenses against categories; variance and re-forecast
+FR-14
+Version history with diff between any two versions
+FR-15
+Accessibility: WCAG 2.2 AA; keyboard complete; reduced-motion support
+1.7 Non-functional requirements
+Security: auth, row-level security, rate limits, prompt-injection defense. Privacy: no PII in logs; deletion on request. Performance: see 1.5. Reliability: Section 11. Observability: structured logs, traces, metrics, LLM cost per event. Browsers: last two versions of Chrome, Safari, Edge, Firefox; mobile-first at 360px.
+2. Core concept and invariants
+The Event is one JSON document, versioned. Every mutation produces a new immutable version. Invariants, enforced by the validator before any write:
+• I1 Budget lines sum exactly to total budget (integer rupees).
+• I2 Contingency >= 5% of budget.
+• I3 Every open task due date lies between today and the event date (completed tasks exempt from the past-date rule).
+• I4 Every dependency id exists and the graph is acyclic.
+• I5 A dependency never finishes after its dependent starts.
+• I6 Locked budget lines are never changed by automatic rebalancing.
+• I7 Venue capacity >= guest count where the venue declares capacity.
+• I8 Every task category exists in the event-type template.
+• I9 Version number increases by exactly 1 and the parent version exists.
+• I10 All text fields are length-bounded and sanitized.
+If an operation set violates an invariant it is rejected with machine-readable reason codes. The LLM retries with those codes (max 2). If it still fails, the user sees a plain-language explanation and the plan stays unchanged. The LLM never grades itself.
+3. System architecture
+Browser (Next.js 15, React 19, TypeScript)
+  |  HTTPS REST + SSE (jobs)         |  WebSocket (Supabase Realtime: event channel + presence)
+  v                                  v
+Edge/CDN (Vercel) ---> API: FastAPI (Python 3.12, uvicorn, 2+ replicas on Railway)
+                        |-- Auth middleware (Supabase JWT verify via JWKS)
+                        |-- Rate limit + idempotency (Redis / Upstash)
+                        |-- Domain Engine (pure functions: ops, budget, timeline, health, validate, diff)
+                        |-- Orchestrator (Intake, Planner, Ops, Vendor, Ideas agents) --> LLM Gateway
+                        |-- Job runner (arq workers on Redis) for long generations
+                        |-- Export service (WeasyPrint PDF, icalendar ICS)
+                        v
+                  Postgres (Supabase): events, event_versions, jobs, expenses, quotes,
+                  share_links, audit_log, templates (pgvector)
+LLM Gateway: primary model, fast model, timeouts, retries with jitter, circuit breaker,
+             fallback model, token and cost accounting, response cache
+Observability: OpenTelemetry traces, Sentry, structured JSON logs, Prometheus metrics, uptime probe
+Key decisions:
+1. LLM proposes typed operations; code disposes. The model never writes the Event directly. It returns a list of ops from a closed vocabulary and the Domain Engine applies them. This removes whole classes of corruption.
+2. Pure domain core. The engine has no IO, so it is property-testable and runs identically in preview and commit.
+3. Immutable versions. Undo, diff, audit and realtime sync all come from the version table.
+4. Two paths. Deterministic fast path (sliders, form edits, under 1s) and LLM path (language edits, generation, drafts).
+5. Jobs for anything over 2s, streamed over SSE with stage events; the client can reconnect and resume by job id.
+4. Data model (Postgres)
+create table events (
+  id uuid primary key default gen_random_uuid(),
+  owner_id uuid not null references auth.users(id),
+  type text not null check (type in ('wedding','birthday','community')),
+  current_version int not null default 1,
+  state jsonb not null,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now(),
+  deleted_at timestamptz
+);
+create table event_versions (
+  event_id uuid references events(id) on delete cascade,
+  version int not null,
+  state jsonb not null,
+  ops jsonb not null,
+  diff jsonb not null,
+  cause text not null,
+  health int not null,
+  created_by uuid,
+  created_at timestamptz default now(),
+  primary key (event_id, version)
+);
+create table jobs (
+  id uuid primary key default gen_random_uuid(),
+  event_id uuid, kind text,
+  status text check (status in ('queued','running','done','failed')),
+  stage text, result jsonb, error jsonb,
+  idempotency_key text unique,
+  created_at timestamptz default now(), finished_at timestamptz
+);
+create table expenses (id uuid primary key default gen_random_uuid(), event_id uuid references events(id) on delete cascade, category text not null, amount int not null check (amount >= 0), note text, paid_on date, created_at timestamptz default now());
+create table quotes (id uuid primary key default gen_random_uuid(), event_id uuid references events(id) on delete cascade, category text not null, vendor_name text not null, amount int not null, inclusions text, received_on date);
+create table share_links (token_hash text primary key, event_id uuid references events(id) on delete cascade, role text check (role in ('family','vendor','volunteer')), scope jsonb, expires_at timestamptz not null, revoked_at timestamptz);
+create table audit_log (id bigserial primary key, event_id uuid, actor uuid, action text, meta jsonb, at timestamptz default now());
+create table templates (id serial primary key, event_type text, region text, kind text, title text, body text, source text, embedding vector(1024));
+Concurrency: writes use update events set ... where id = $1 and current_version = $2 (optimistic lock); zero rows updated returns 409 with the latest version. Row-level security on every table: owner has full access; share-link access only through server-side role-scoped views. Indexes: event_versions(event_id, version desc), jobs(idempotency_key), HNSW on templates.embedding.
+5. Domain engine (deterministic core)
+5.1 Event schema
+Fields: version, type, event_date, today, guests, city, city_tier (1..3), budget (int rupees), tier (lean|standard|premium), brief (vibe, constraints, assumptions[]), functions[] (wedding only: name, date, guests), lines[] (category, planned, actual, locked, floor), tasks[] (id, title, category, start, due, duration_days, depends_on[], owner, status, critical), vendors[] (category, name, status, quote, capacity), ideas, risks[]. Implement with Pydantic v2, extra='forbid', strict types, bounded string lengths. Mirror the pure functions in a small TypeScript package for instant slider preview.
+5.2 Typed operations (closed vocabulary)
+SetBudget(total), SetGuests(n, function?), SetDate(date), SetCity(city), SetTier(tier), LockLine(category), UnlockLine(category), SetLine(category, amount), CancelVendor(category, name?), SelectVendor(category, name), AddTask(...), RemoveTask(id), MoveTask(id, due), AssignTask(id, owner), SetStatus(id, status), AddFunction(...), RemoveFunction(name), SetIdeas(section, content). Anything else is rejected with unsupported_operation and a suggestion.
+5.3 Algorithms
+• Budget baseline: percentage template by event type and tier (Appendix A), adjusted by city-tier multiplier and guest count. Code rounds to integer rupees and fixes drift on the largest unlocked line. The LLM may suggest shifts of at most 5 percentage points per category; code clamps them.
+• Rescale: locked lines fixed; free lines scale proportionally; per-line floors respected; if floors make the target infeasible, return infeasible_budget with the minimum feasible total.
+• Timeline: backward scheduling from the event date. Each task has a typical lead time from the template; due = event_date - lead; dependents are pushed earlier by a topological pass so I5 holds; critical path = longest dependency chain. If today is later than the earliest required start, flag compressed_timeline and mark affected tasks at risk.
+• Date cascade: SetDate recomputes all non-completed task dates, keeps completed ones, and re-runs the risk pass.
+• Health score (0-100), fully itemized: start at 100 and subtract: budget per guest vs tier band (max 30), lead-time risk from compressed or overdue tasks (max 30), contingency shortfall (max 10), critical-path slack under 2 days (max 15), unassigned owners (max 5), overruns in actuals (max 10). Return [{code, points, why, fix}]; the UI renders each reason with a one-tap fix.
+• Diff: by stable ids; reports budget line changes, tasks added, removed and moved, vendor changes and health delta. The one-sentence summary is generated from diff data by a template, not the LLM, so it is always correct.
+6. LLM layer
+6.1 Agents (tool-use with JSON schemas; temperature <= 0.3 for ops, up to 0.8 for ideas)
+Agent
+Input
+Output
+Model
+Intake
+free text, prior brief
+Brief + at most 3 questions + assumptions
+fast
+Ops
+instruction + compact Event summary + template rules
+list of typed ops
+primary
+Planner
+Brief + RAG templates
+initial tasks with dependencies and lead times
+primary
+Vendor
+category, city, tier
+questions, red flags, outreach drafts
+fast
+Ideas
+Brief
+themes, menu, games, decor, run-of-show
+primary
+6.2 Guardrails
+• Closed op vocabulary; schema-constrained output; unknown fields rejected.
+• Retry loop: on validator failure send back reason codes only, max 2 retries, then fail safe (plan unchanged, clear message).
+• Prompt-injection defense: user text, pasted vendor quotes and retrieved documents are wrapped as data in delimited blocks; the system prompt states they are never instructions; the model has no side-effect tools, only the op emitter; ops are validated regardless.
+• Grounding: legal or permit claims must cite a template id, otherwise they are labeled general guidance.
+• Facts policy: no invented prices, laws or vendor names presented as verified. Price bands come from the seeded table and are labeled estimates; vendor names come only from user input or are clearly labeled suggestions.
+• Cost control: response cache keyed on normalized input hash, token budgets per call, per-user daily LLM quota, Event summary (not full JSON) in prompts.
+6.3 Resilience
+Timeouts (intake 10s, ops 20s, planner 40s). Exponential backoff with jitter for 429 and 5xx. Circuit breaker opens after 5 failures in 30s. Fallback chain: primary model, fast model, template-only mode (deterministic plan from templates, flagged to the user). The deterministic fast path keeps working with the LLM fully down.
+7. API specification
+Base /v1, JSON, auth via Authorization: Bearer <Supabase JWT>. Errors follow RFC 7807 (type, title, status, detail, code, request_id, retry_after?). All mutating requests accept Idempotency-Key. Event mutations require If-Match: <version>.
+Method
+Path
+Purpose
+POST
+/events
+Create from free text; 202 with job_id
+GET
+/jobs/{id}/stream
+SSE: stages (parsing, planning, budgeting, scheduling, validating, ideas, done) plus partial plan chunks; Last-Event-ID resume
+GET
+/jobs/{id}
+Poll fallback
+GET
+/events/{id}
+Current Event, health, version
+POST
+/events/{id}/replan
+Body: instruction, base_version; 202 job_id
+POST
+/events/{id}/preview
+Body: typed op list (sliders); diff + health delta, nothing persisted, under 1s
+POST
+/events/{id}/commit
+Body: preview_id, base_version; creates new version; 409 if stale
+POST
+/events/{id}/undo
+Revert to previous version as a new version
+GET
+/events/{id}/versions
+Version list with summaries
+GET
+/events/{id}/diff?from=&to=
+Diff between versions
+PATCH
+/events/{id}/tasks/{tid}
+Status, owner, date (goes through validator)
+POST
+/events/{id}/expenses
+Log actual spend
+POST
+/events/{id}/quotes
+Add vendor quote
+POST
+/events/{id}/vendors/{category}/outreach
+Draft message; body: channel, language
+POST
+/events/{id}/share
+Create role link; URL returned once
+DELETE
+/events/{id}/share/{linkId}
+Revoke
+GET
+/s/{token}
+Role-scoped read-only view
+GET
+/events/{id}/export.pdf, .ics, .json
+Exports
+GET
+/healthz, /readyz, /metrics
+Liveness; readiness (DB, Redis, LLM circuit state); Prometheus
+Rate limits: 60 req/min per user; 10 LLM jobs per hour per user; 20 req/min per share token. Responses include X-Request-ID and RateLimit-* headers.
+8. Realtime design
+• Job progress: SSE with heartbeat every 15s, event ids for resume, automatic fallback to polling after two failed reconnects.
+• Multi-user sync: Supabase Realtime channel event:{id} broadcasts version_committed (version, diff summary). Clients apply the diff or refetch; stale local edits get a 409 and a merge prompt only when the same entity changed.
+• Presence: avatars and who is viewing which tab; ephemeral, never persisted.
+• Optimistic UI: sliders render from the local TypeScript engine and reconcile to the server preview.
+• Offline: read-only cached plan via service worker; queued task-status edits replay on reconnect with idempotency keys.
+• Shared test vectors: one JSON file of input/expected-output pairs runs against both the Python and TypeScript engines in CI, so preview and commit can never disagree.
+9. UI/UX specification
+9.1 Design language: quiet luxury
+Ivory canvas, ink text, one saffron accent. Editorial serif headings, clean sans for data. Generous whitespace, hairline borders, soft layered shadows, 14px card radius, no stock component look.
+Token
+Value
+bg
+#FBF7F0
+surface
+#FFFFFF
+ink
+#14110F
+muted
+#6B645C
+accent (saffron)
+#E8A33D
+accent-deep
+#B9771B
+success / warn / danger
+#2F7D5B / #C98A1B / #B3402F
+dark mode
+bg #0F0D0B, surface #1A1714, ink #F5EFE6
+fonts
+Fraunces (display), Inter (UI), JetBrains Mono (numbers)
+spacing and type
+4px base; type scale 12/14/16/20/28/40
+motion
+180ms ease-out; spring for diff reorder; honor prefers-reduced-motion
+9.2 Screens
+1. Welcome and Intake: one large prompt field ('Tell me about your event'), example chips, mic button. The plan assembles live below as skeleton cards resolving through the SSE stages. Follow-up questions appear inline as tappable chips (max 3).
+2. Dashboard: title, date countdown, Health ring (click for itemized reasons and one-tap fixes). Tabs: Overview, Budget, Timeline, Vendors, Ideas, History. Overview shows the next 5 tasks, budget donut with planned vs actual rings, and a risk strip.
+3. Budget: table with inline edit, lock icon per line, overrun badges, total slider with live preview diff pinned right, expense drawer.
+4. Timeline: Gantt with dependency arrows, critical path in saffron, drag to move with validator feedback, today marker, compressed-timeline warning band.
+5. Vendors: category cards; expand for questions, red flags, quote comparison table (normalized Rs per guest, best-value badge), outreach composer with channel and language toggle, copy or open in WhatsApp.
+6. Ideas: moodboard cards for themes, menu, games, decor, run-of-show, with regenerate-with-constraint.
+7. Replan command bar (Cmd+K): natural-language input; parsed ops shown as readable chips for confirmation, then before/after diff (green added, red removed, amber moved) with animated numbers, health delta, Apply and Discard. Undo toast for 30s.
+8. History: version timeline; pick two to diff.
+9. Share and Export: role picker, expiry, copy link, QR, export buttons.
+10. Shared role view: minimal, mobile-first, no navigation clutter.
+11. /status: validator pass counts, LLM latency, circuit state, eval results.
+9.3 States and quality bars
+Every screen defines empty, loading (skeleton, never spinner-only), partial, error (plain language, retry, what is preserved), offline, and degraded (banner: 'Smart suggestions are limited right now; your plan is safe'). LLM-driven changes show ops as chips before applying. Copy is warm, short, specific. Accessibility: visible focus rings, ARIA live regions for streamed updates, color never the sole signal, 44px touch targets, contrast >= 4.5:1. Lighthouse mobile targets: performance >= 90, accessibility >= 95.
+10. Security and privacy
+• Auth: Supabase Auth (email OTP, Google). JWT verified in FastAPI via cached JWKS; short expiry.
+• Authorization: owner checks in code plus Postgres RLS (defense in depth). Share tokens: 256-bit random, stored as peppered SHA-256 hash, shown once, scoped, expiring, revocable, rate-limited.
+• Input: Pydantic strict validation; length caps (brief 4,000 chars, instruction 1,000); output escaped on render; no raw HTML from the model; markdown sanitized.
+• Secrets: platform secret stores only; gitleaks in CI; rotation runbook.
+• Transport: HTTPS only, HSTS, strict CSP, CORS allowlist, SameSite cookies.
+• Abuse: per-user LLM quotas, global spend cap with automatic switch to template-only mode, Turnstile on anonymous trials.
+• Privacy: collect minimum PII; redaction middleware keeps PII out of logs; export and delete endpoints; provider-side training use disabled; plain privacy note in the UI.
+• Supply chain: pinned lockfiles, Dependabot, pip-audit and npm audit in CI.
+11. Reliability and production hardening
+Risk
+Mitigation
+LLM down or slow
+timeouts, jittered retries, circuit breaker, fallback model, template-only mode; deterministic fast path unaffected
+Invalid LLM output
+schema + closed ops + validator + 2 retries + fail-safe unchanged plan
+Concurrent edits
+optimistic locking (409), versioned writes, merge prompt
+Duplicate requests
+Idempotency-Key table; jobs unique on key
+Worker crash mid-job
+per-stage persisted status; jobs running over 120s are reaped and retried once
+DB failure
+managed Postgres, PITR backups (daily + WAL), pgbouncer pooling, expand-then-contract migrations
+Redis failure
+rate limiting falls back to in-memory limiter; jobs fall back to in-process queue with a warning
+Traffic spike
+horizontal replicas, autoscale on CPU and queue depth, per-user quotas, request size limits, CDN for static and share views
+Bad deploy
+CI gates, preview deploys, 10% canary, automatic rollback on error-rate breach, feature flags
+Export failure
+exports built from an immutable version snapshot; PDF timeout with retry; async if over 5s
+Date bugs
+ISO dates in Asia/Kolkata, no naive datetimes, property tests across leap years and month ends
+SLOs: 99.9% availability; p95 under 300ms for non-LLM endpoints; written error-budget policy. Observability: trace id from browser to worker to LLM call; dashboards for latency, error rate, validator failures by code, LLM cost per event, circuit state. Alerts on SLO burn, validator-failure spike, spend at 80% of cap. Runbooks (docs/RUNBOOKS.md): LLM outage, DB failover, job backlog, key leak, rollback.
+12. Testing and evaluation
+• Unit and property-based (Hypothesis): for any sequence of random valid ops the engine output passes the validator or is rejected with a reason; budget always sums; rescale is idempotent; no cycles; dates ordered. 10,000 cases per property in CI.
+• Cross-language vectors: Python and TypeScript engines agree on 500 vectors.
+• Golden evals (50 scripted edits): guests up and down, budget cuts and raises, venue cancelled, date earlier and later, type switch, locked lines, infeasible budgets, injection attempts embedded in text, ambiguous instructions, Hinglish input. Metrics: first-pass validity, validity after retry, diff precision (no unrelated changes), median latency, cost. Published at /status and in the README.
+• Adversarial: prompt-injection corpus, oversized input, unicode edge cases.
+• E2E (Playwright): full demo script at desktop and 360px; offline and reconnect; two-browser realtime sync.
+• Load (k6): 200 concurrent users on non-LLM endpoints with p95 <= 300ms; 50 concurrent LLM jobs against a mocked provider.
+• Chaos: LLM returns 500s, Redis killed, worker killed mid-job, slow DB; assert the degraded behaviors in Section 11.
+• Accessibility: axe in CI plus a manual keyboard pass.
+Definition of done for any feature: unit tests, an eval case if LLM-touching, defined empty and error states, telemetry, docs updated.
+13. DevOps
+• Monorepo: apps/web, apps/api, packages/engine-ts, data/templates, eval, docs.
+• CI (GitHub Actions): lint (ruff, eslint), types (mypy strict, tsc), unit, property tests, vectors, eval smoke (10 cases), build, security scans. On main: web to Vercel; api and worker to Railway with health-gated rollout; migrations run before deploy.
+• Environments: local (docker compose: postgres, redis, api, worker), preview per PR, production.
+• Env vars: ANTHROPIC_API_KEY, MODEL_PRIMARY (claude-sonnet-5-5), MODEL_FAST (claude-haiku-5-5), SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_KEY, DATABASE_URL, REDIS_URL, SENTRY_DSN, LLM_DAILY_USER_QUOTA, LLM_GLOBAL_SPEND_CAP, TEMPLATE_ONLY_MODE, SHARE_TOKEN_PEPPER.
+14. Roadmap (72 hours) and cut list
+• Day 1: schema, engine (ops, budget, timeline, validator, diff, health), vectors, property tests, Supabase tables, auth.
+• Day 2: LLM gateway, intake, planner, ops agent, SSE jobs, replan, preview and commit endpoints, vendor and ideas agents, RAG seeds.
+• Day 3: UI (intake, dashboard, command bar, history), realtime, share and export, /status, eval run, README, demo recording.
+• Cut if short, in order: voice, Hinglish drafts, presence, offline mode, dark mode.
+• Never cut: validator, typed ops, diff, health score, eval table, degraded mode.
+15. Demo and submission
+Demo (3:00)
+1. Hook: plans rot after creation.
+2. Generate: 'Sister's wedding, 200 guests, Rs 12L, Jaipur, December' gives a full plan with a Health score.
+3. Drag the budget to Rs 9L: live diff, locked lines untouched, health delta explained.
+4. 'Caterer cancelled': timeline cascade, shortlist, Hinglish WhatsApp draft.
+5. Guests 200 to 350: venue-capacity conflict is caught by the validator and repaired on screen.
+6. Community Diwali mela mode: permits, volunteer roster, role-based share link opened on a phone.
+7. Kill switch: LLM disabled, plan still works in degraded mode.
+8. Eval table, PDF and .ics export.
+Submission paragraph Aayojan is a verified event-planning engine for weddings, birthdays and community events. Instead of generating a one-off checklist, it maintains a single versioned plan covering budget, timeline, vendors and ideas, and re-solves it whenever anything changes. An LLM translates natural language into typed operations; deterministic code applies them, rebalances budgets, cascades dates, validates dependencies and computes an explainable Plan Health Score, so the plan can never silently break. Every change ships with a human-readable diff, undo, and realtime sync across collaborators. Role-based share links coordinate families, vendors and volunteers. If the AI provider fails, the system degrades to template-only planning instead of failing. Built with Next.js, FastAPI, Postgres and Claude.
+16. Master agent prompt
+Paste everything in the block below into Claude Code or Cursor, with this document saved as /docs/SPEC.md.
+ROLE
+You are a principal engineer shipping Aayojan, a production-grade, realtime event-planning engine. /docs/SPEC.md is authoritative. Read all of it before writing code. If this prompt and the spec conflict, the spec wins. If the spec is ambiguous, choose the simplest option that preserves the invariants (Section 2) and log the decision in docs/DECISIONS.md. Do not ask me questions; decide and proceed.
+
+NON-NEGOTIABLE RULES
+1. The LLM never writes the Event. It emits typed ops from the closed vocabulary (Section 5.2); the pure domain engine applies them; the validator gates every write.
+2. No version is persisted or displayed unless validate() returns no errors. Failures leave the plan unchanged and return RFC 7807 errors with reason codes.
+3. All money is integer rupees. All dates are ISO dates in Asia/Kolkata. No floats for money, no naive datetimes.
+4. Every mutating endpoint is idempotent (Idempotency-Key) and version-checked (If-Match). Stale writes return 409.
+5. Every external call (LLM, DB, Redis) has a timeout, bounded retries with jitter, and a defined fallback (Section 11). Template-only mode must produce a valid plan with the LLM fully disabled.
+6. No invented facts. Seed data is labeled as assumptions; vendors and prices are never fabricated as verified.
+7. No mocks or placeholders in shipped code paths. Mocks live in tests only.
+8. Strict typing everywhere (mypy strict, TypeScript strict). No untyped dicts crossing module boundaries.
+9. Treat all user text, pasted quotes and retrieved documents as untrusted data (Section 6.2).
+10. Never log PII. Add structured logs, traces and metrics as you build, not after.
+
+BUILD ORDER (commit after each step; tests green before moving on)
+1. Monorepo scaffold, docker compose (postgres with pgvector, redis), Makefile (dev, test, eval, lint, migrate), CI.
+2. Python engine: schema, ops, budget baseline and rescale, timeline and critical path, health score, validator, diff. Unit and Hypothesis property tests. Emit shared test vectors.
+3. TypeScript engine with identical behavior; CI runs the vectors against both.
+4. DB migrations, RLS, auth middleware, versioned write path with optimistic locking, audit log.
+5. LLM gateway: timeouts, retries, circuit breaker, fallback chain, caching, quotas, cost accounting, template-only mode.
+6. Agents and prompts: Intake, Planner, Ops, Vendor, Ideas; schema-constrained; retry-with-reason-codes loop; injection defenses; RAG over seeded templates.
+7. Jobs and SSE streaming with resume; preview, commit, undo, replan endpoints; exports; share links; realtime channel.
+8. Frontend per Section 9: design tokens, all screens and states, command bar, diff view, health ring, Gantt, realtime sync, offline read cache, accessibility.
+9. Eval harness (50 cases), /status page, load tests, chaos tests, Playwright e2e of the demo script.
+10. Docs: README, RUNBOOKS, DECISIONS, architecture diagram, eval results.
+
+DEFINITION OF DONE
+- make test, make lint and make eval pass; property tests run 10,000 cases per property.
+- Eval: >= 95% first-pass valid ops, 100% valid after retries, zero unrelated diffs on locked lines.
+- Chaos: LLM down, Redis down, worker killed mid-job, slow DB: app stays usable in degraded mode per Section 11.
+- Lighthouse mobile: performance >= 90, accessibility >= 95. axe: zero serious violations.
+- Demo script (Section 15) passes end to end in Playwright at desktop and 360px.
+
+FINAL OUTPUT
+Report: how to run locally and deploy, env vars, eval numbers, chaos results, known limitations, next steps. Be terse.
+Appendix A. Seed data (editable assumptions, not verified market data)
+Before the demo, calibrate per-guest price bands from at least 10 real quotes per city tier. Until then the health score uses percentage templates and relative bands only, and the UI labels figures as estimates.
+Budget templates, standard tier (percent of total)
+Wedding
+%
+Birthday
+%
+Community event
+%
+Catering
+30
+Catering
+35
+Venue, permits, infrastructure
+25
+Venue
+18
+Venue
+20
+Food and beverage
+20
+Decor and florals
+10
+Decor
+12
+Stalls and decor
+15
+Attire and jewellery
+10
+Entertainment and games
+12
+Entertainment
+12
+Photo and video
+8
+Cake
+6
+Safety, medical, insurance
+8
+Entertainment and music
+5
+Return gifts
+5
+Marketing
+5
+Accommodation and travel
+5
+Photography
+3
+Volunteer needs
+5
+Rituals and logistics
+4
+Invitations
+2
+Waste and cleanup
+3
+Invitations and gifts
+3
+Contingency
+5
+Contingency
+7
+Makeup and mehendi
+2
+
+
+
+
+Contingency
+5
+
+
+
+
+Default lead times (days before event; calibrate)
+Event
+Task lead times
+Wedding
+venue 180, caterer 150, photographer 150, decor 90, attire 90, invitations 60, music 60, accommodation 60, rituals and pandit 45
+Birthday
+venue 30, caterer 21, entertainer 21, decor 14, invitations 14, cake 7
+Community
+permits 45, ground or venue 60, sponsors 60, volunteers 30, vendors 30, safety and medical 21, publicity 21
+Template sources for RAG: curate 15 to 20 short, cited documents per event type (ritual sequences, permit checklists by city, safety checklists, age-band activity lists), each with a source field; the Ideas and Planner agents must cite template ids.
